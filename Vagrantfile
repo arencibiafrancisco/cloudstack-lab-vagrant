@@ -79,10 +79,10 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
       git clone https://github.com/arencibiafrancisco/kvm.git || true
       cd kvm
 
-      echo '[hypervisor]' > hosts
+      echo '[hypervisors]' > hosts
       echo '127.0.0.1 ansible_connection=local' >> hosts
 
-      ansible-playbook kvm-playbook.yml -i hosts -u root --tags "kvm,cockpit"
+      sudo ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook kvm-playbook.yml -i hosts -u root --tags "kvm,cockpit"
 
       cat <<EOF | sudo tee /etc/netplan/01-cloudbr0.yaml
 network:
