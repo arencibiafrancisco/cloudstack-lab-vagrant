@@ -1,118 +1,177 @@
-# Vagrantfile profesional para entorno CloudStack + KVM con Ansible sin bonds, usando una interfaz detectada dinámicamente
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
 
 VAGRANTFILE_API_VERSION = "2"
-iface = IO.popen("ip -o link show | awk -F': ' '{print $2}' | grep -Ev 'lo|eth0|virbr0|docker|br-|veth' | head -n 1").read.strip
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.box = "ubuntu/jammy64"
-  config.ssh.insert_key = true
+  config.ssh.insert_key = false
+  config.ssh.private_key_path = ["~/.vagrant.d/insecure_private_key", "~/.ssh/id_rsa"]
+  config.ssh.forward_agent = true
 
-  # Variables comunes
-  common_provisioning = <<-SCRIPT
-    sudo touch /etc/cloud/cloud-init.disabled
-    sudo apt-get update && sudo apt-get install -y software-properties-common git curl jq
-    sudo usermod -aG sudo vagrant
-    echo "vagrant ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/vagrant
-
+  # Configuración común para todas las VMs
+  config.vm.provision "shell", inline: <<-SHELL
+    # Configuración básica de SSH
     mkdir -p /home/vagrant/.ssh
-    cp /vagrant/id_rsa.pub /home/vagrant/.ssh/authorized_keys
-    chown -R vagrant:vagrant /home/vagrant/.ssh
     chmod 700 /home/vagrant/.ssh
-    chmod 600 /home/vagrant/.ssh/authorized_keys
+    echo "vagrant ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/vagrant
+    sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+    sudo systemctl restart ssh
 
-    # Habilitar root con clave pública SSH
-    mkdir -p /root/.ssh
-    cp /vagrant/id_rsa.pub /root/.ssh/authorized_keys
-    chmod 700 /root/.ssh
-    chmod 600 /root/.ssh/authorized_keys
-  SCRIPT
+        # Establecer contraseñas
+    echo "root:password" | sudo chpasswd
+    echo "vagrant:vagrant" | sudo chpasswd
 
-  # VM 1: CloudStack Management + NFS
+    # Deshabilitar cloud-init
+    sudo touch /etc/cloud/cloud-init.disabled
+  SHELL
+
+  # VM 1: CloudStack Management
   config.vm.define "cloudstack-mgmt" do |mgmt|
     mgmt.vm.hostname = "cloudstack-mgmt"
-    mgmt.vm.network "private_network", ip: "192.168.56.10"
+    mgmt.vm.network "private_network", ip: "192.168.56.10", netmask: "24"
     mgmt.vm.network "forwarded_port", guest: 22, host: 2223, id: "ssh"
+    mgmt.vm.network "forwarded_port", guest: 8080, host: 8080, host_ip: "127.0.0.1"
+
     mgmt.vm.provider "virtualbox" do |vb|
       vb.name = "cloudstack-mgmt"
       vb.memory = 4096
       vb.cpus = 2
+      vb.customize ["modifyvm", :id, "--nic1", "nat"]
+      vb.customize ["modifyvm", :id, "--nic2", "hostonly"]
+      vb.customize ["modifyvm", :id, "--hostonlyadapter2", "vboxnet0"]
     end
-    mgmt.vm.provision "file", source: File.expand_path("~/.ssh/id_rsa.pub"), destination: "/vagrant/id_rsa.pub"
-    mgmt.vm.provision "shell", inline: common_provisioning
-    mgmt.vm.provision "shell", inline: <<-SHELL
-      sudo apt-add-repository --yes --update ppa:ansible/ansible
-      sudo apt-get install -y ansible
 
+    mgmt.vm.provision "shell", inline: <<-SHELL
+      # Eliminar configuraciones de netplan existentes
+      sudo rm -f /etc/netplan/*
+
+      # Configuración de red
+      cat <<EOF | sudo tee /etc/netplan/01-netcfg.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enp0s3:
+      dhcp4: true
+    enp0s8:
+      dhcp4: no
+      addresses: [192.168.56.10/24]
+EOF
+      sudo netplan apply
+
+      # Instalar dependencias
+      sudo apt-get update && sudo apt-get install -y software-properties-common
+      sudo add-apt-repository -y ppa:ansible/ansible
+      sudo apt-get update && sudo apt-get install -y ansible git python3-pip
+
+      # Clonar repositorio con roles de Ansible
       git clone https://github.com/arencibiafrancisco/cloudstack-installer.git || true
       cd cloudstack-installer
 
-      echo '[acs-manager]' > hosts
-      echo '127.0.0.1 ansible_connection=local' >> hosts
+      # Crear inventario de Ansible
+      cat <<EOF > hosts
+[acs-manager]
+127.0.0.1 ansible_connection=local
 
-      sudo ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook deploy-cloudstack.yml -i hosts \
+EOF
+
+      # Ejecutar playbook de CloudStack
+      sudo ansible-playbook deploy-cloudstack.yml -i hosts \
         -e "nodetype=master mysql_root_password=Cl0ud5tack-MySQL \
         mysql_cloud_password=Cl0ud5tack-Cl0ud cloudstack_release=4.19 \
         cloudstack_systemvmtemplate=4.19.1 install_local_db=true"
     SHELL
-    mgmt.vm.provision "shell", inline: "echo '[INFO] CloudStack Manager IP: 192.168.56.10'"
   end
 
   # VM 2: KVM Host
   config.vm.define "kvm-node" do |kvm|
     kvm.vm.hostname = "kvm-node"
-    kvm.vm.network "private_network", type: "static", ip: "192.168.56.20"
+    kvm.vm.network "private_network", ip: "192.168.56.20", netmask: "24"
     kvm.vm.network "forwarded_port", guest: 22, host: 2222, id: "ssh"
+    
     kvm.vm.provider "virtualbox" do |vb|
       vb.name = "kvm-node"
       vb.memory = 4096
       vb.cpus = 2
       vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+      vb.customize ["modifyvm", :id, "--nic1", "nat"]
+      vb.customize ["modifyvm", :id, "--nic2", "hostonly"]
+      vb.customize ["modifyvm", :id, "--hostonlyadapter2", "vboxnet0"]
       vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
     end
 
-    kvm.vm.provision "file", source: File.expand_path("~/.ssh/id_rsa.pub"), destination: "/vagrant/id_rsa.pub"
-    kvm.vm.provision "shell", inline: common_provisioning
     kvm.vm.provision "shell", inline: <<-SHELL
-      sudo apt-add-repository --yes --update ppa:ansible/ansible
-      sudo apt-get install -y ansible
+      # Eliminar configuraciones de netplan existentes
+      sudo rm -f /etc/netplan/*
 
-      git clone https://github.com/arencibiafrancisco/kvm.git || true
-      cd kvm
-
-      echo '[hypervisors]' > hosts
-      echo '127.0.0.1 ansible_connection=local' >> hosts
-
-      sudo ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook kvm-playbook.yml -i hosts -u root --tags "kvm,cockpit"
-
-      cat <<EOF | sudo tee /etc/netplan/01-cloudbr0.yaml
+      # Configuración de red y bridge cloudbr0
+      cat <<EOF | sudo tee /etc/netplan/01-netcfg.yaml
 network:
   version: 2
   renderer: networkd
   ethernets:
+    enp0s3:
+      dhcp4: true
     enp0s8:
       dhcp4: no
+      addresses: [192.168.56.20/24]
   bridges:
     cloudbr0:
       interfaces: [enp0s8]
       addresses: [192.168.56.20/24]
-      routes:
-        - to: default
-          via: 192.168.56.1
-      nameservers:
-        addresses: [8.8.8.8, 1.1.1.1]
       parameters:
         stp: false
         forward-delay: 0
 EOF
-
-      sudo netplan generate
       sudo netplan apply
 
-      # Verificar conectividad
-      sleep 5
-      ping -c 3 192.168.56.1 || echo "⚠️ Verificando conectividad con el gateway"
-      ping -c 3 8.8.8.8 || echo "⚠️ Verificando conectividad a Internet"
+      # Instalar dependencias
+      sudo apt-get update && sudo apt-get install -y software-properties-common
+      sudo add-apt-repository -y ppa:ansible/ansible
+      sudo apt-get update && sudo apt-get install -y ansible git python3-pip qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
+
+      # Clonar repositorio con roles de KVM
+      git clone https://github.com/arencibiafrancisco/kvm.git || true
+      cd kvm
+
+      # Crear inventario de Ansible
+      cat <<EOF > hosts
+[hypervisors]
+127.0.0.1 ansible_connection=local
+EOF
+
+      # Ejecutar playbook de KVM
+      sudo ansible-playbook kvm-playbook.yml -i hosts -u root --tags "kvm,cockpit"
+
+      # Configurar CloudStack Agent
+      sudo apt-get install -y cloudstack-agent
+      cat <<EOF | sudo tee /etc/cloudstack/agent/agent.properties
+host=192.168.56.10
+port=8250
+zone=default
+pod=pod1
+cluster=cluster1
+guid=KVM-$(hostname | md5sum | cut -c1-8)
+EOF
+      sudo systemctl enable cloudstack-agent
+      sudo systemctl restart cloudstack-agent
     SHELL
-    kvm.vm.provision "shell", inline: "echo '[INFO] KVM Node IP: 192.168.56.20'"
   end
+
+  # Configuración post-instalación
+  config.vm.provision "shell", inline: <<-SHELL
+    echo "-----------------------------------------------------------"
+    echo "          Entorno CloudStack + KVM configurado"
+    echo "-----------------------------------------------------------"
+    echo " CloudStack Management: http://192.168.56.10:8080/client"
+    echo " Usuario: admin"
+    echo " Password: password"
+    echo ""
+    echo " KVM Host: 192.168.56.20"
+    echo " Bridge cloudbr0 configurado en KVM host"
+    echo " Acceso SSH: vagrant ssh kvm-node"
+    echo "-----------------------------------------------------------"
+  SHELL
 end
